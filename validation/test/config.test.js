@@ -13,6 +13,12 @@ test('the root Wrangler config is the only deployment contract', () => {
   assert.match(root, /^main\s*=\s*"app\/src\/index\.js"/m);
   assert.match(root, /^name\s*=\s*"telegram-web-cloudflare-workers"/m);
   assert.match(root, /^compatibility_date\s*=\s*"\d{4}-\d{2}-\d{2}"/m);
+  assert.match(root, /^preview_urls\s*=\s*false/m);
+  assert.match(root, /^invocation_logs\s*=\s*false/m);
+  assert.match(root, /^PROXY_ALLOW_ROOT_V1\s*=\s*false\s*$/m);
+  for (const name of ['RELAY_CLIENT_LIMIT', 'RELAY_EDGE_LIMIT']) {
+    assert.match(root, new RegExp(`\\[\\[ratelimits\\]\\]\\s+name = "${name}"`));
+  }
   assert.match(root, /^new_sqlite_classes\s*=\s*\["RelayDO"\]/m);
 });
 
@@ -26,7 +32,9 @@ test('app tooling explicitly consumes the root Wrangler config', () => {
     assert.match(packageJson.scripts[scriptName], /--config \.\.\/wrangler\.toml(?:\s|$)/);
     assert.doesNotMatch(packageJson.scripts[scriptName], /wrangler@/);
   }
-  assert.equal(packageJson.devDependencies.wrangler, '4.127.0');
+  const lock = JSON.parse(readFileSync(new URL('../../app/package-lock.json', import.meta.url), 'utf8'));
+  assert.match(packageJson.devDependencies.wrangler, /^4\.\d+\.\d+$/);
+  assert.equal(lock.packages['node_modules/wrangler'].version, packageJson.devDependencies.wrangler);
 
   const vitestConfig = readFileSync(
     new URL('../../app/vitest.config.js', import.meta.url),

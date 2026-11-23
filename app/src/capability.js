@@ -31,20 +31,27 @@ export function normalizeWebProxyHost(value) {
   return ascii;
 }
 
-export function computeCapability(host, secretHex) {
-  const canonical = normalizeWebProxyHost(host);
-  if (!canonical) throw new Error('invalid public hostname');
-  const secret = decodeProxySecret(secretHex);
-  return createHmac('sha256', secret)
-    .update(`tdesktop-web-proxy-bridge-v1\n${canonical}`)
-    .digest('base64url');
+export function isProxyBasePath(value) {
+  return typeof value === 'string' && value.length <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9_-]*(?:\/[A-Za-z0-9][A-Za-z0-9_-]*)*$/.test(value);
 }
 
-export function matchesBridgeCapability(value, host, secretHex) {
+export function computeCapability(host, secretHex, basePath = '') {
+  const canonical = normalizeWebProxyHost(host);
+  if (!canonical) throw new Error('invalid public hostname');
+  if (basePath !== '' && !isProxyBasePath(basePath)) throw new Error('invalid proxy base path');
+  const secret = decodeProxySecret(secretHex);
+  const context = basePath
+    ? `tdesktop-web-proxy-bridge-v2\n${canonical}\n${basePath}`
+    : `tdesktop-web-proxy-bridge-v1\n${canonical}`;
+  return createHmac('sha256', secret).update(context).digest('base64url');
+}
+
+export function matchesBridgeCapability(value, host, secretHex, basePath = '') {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
   let expected;
   try {
-    expected = computeCapability(host, secretHex);
+    expected = computeCapability(host, secretHex, basePath);
   } catch {
     return false;
   }

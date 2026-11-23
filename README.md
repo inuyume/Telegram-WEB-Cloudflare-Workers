@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![English](https://img.shields.io/badge/English-README_EN-blue.svg)](README_EN.md)
 [![Workers](https://img.shields.io/badge/Cloudflare-Workers%20Free-orange)](https://developers.cloudflare.com/workers/)
-[![Node](https://img.shields.io/badge/node-%3E%3D22-green)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.12-green)](https://nodejs.org)
 
 上游基线：[`telegramdesktop/tproxy-server@52a5feb7`](https://github.com/telegramdesktop/tproxy-server/tree/52a5feb7fac38f68da5afef9cedd9b3bfc8473ca) / `Telegram Desktop v7.1.2@3772337d`；固定源码断言由 [`validation/test/upstream.test.js`](validation/test/upstream.test.js) 执行。
 
@@ -61,11 +61,22 @@
 ```bash
 # 生成 16 字节随机密钥（32 位 hex）
 node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
-# 示例输出: 000102030405060708090a0b0c0d0e0f
-# 如需 padded-intermediate，则在前面加 dd: dd000102030405060708090a0b0c0d0e0f
+# 如需 padded-intermediate，在本次生成的随机值前加 dd
 ```
 
-> 密钥 **永不进仓库**，仅通过 Cloudflare Secret 注入。`dd` 前缀用于 `padded-intermediate`，普通 16 字节即 `abridged`。
+> 每次部署使用新生成的随机值，不要复用其他代理的密钥。密钥 **永不进仓库**，仅通过 Cloudflare Secret 注入；公开示例值和所有字节重复的密钥会被拒绝。`dd` 前缀用于 `padded-intermediate`，普通 16 字节即 `abridged`。
+
+### 步骤 1 — 设置代理路径
+
+在仓库根目录的 [`wrangler.toml`](wrangler.toml) 的现有 `[vars]` 下配置：
+
+```toml
+[vars]
+PROXY_ALLOW_ROOT_V1 = false
+PROXY_BASE_PATH = "my-relay"
+```
+
+Telegram 的 WEB Proxy 地址填 `你的域名/my-relay`，密钥仍填 `PROXY_SECRET`。路径区分大小写，不是密码。默认关闭只填域名的根路径桥接 v1；**如果不配置路径，也不显式启用 v1，将不开放代理，只保留 `/healthz`**。需要兼容只支持域名的旧客户端时，才把开关设为 `true`。
 
 ---
 
@@ -76,9 +87,9 @@ node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
 1. Fork 本仓库，打开上方按钮，在 Cloudflare 中连接 Git 并选择自己的 Fork。
 2. 项目路径使用仓库根目录 `/`，构建命令设为 `npm --prefix app ci`，部署命令设为 `npm --prefix app run deploy`。这些命令使用锁定的工具版本和根配置。
 3. 首次部署后进入该 Worker 的 **Settings → Variables & Secrets**，添加 **Secret**：`PROXY_SECRET` = 上一步生成的 hex，并保存发布。
-4. 访问 `https://<your-worker>.<subdomain>.workers.dev/readyz`，确认 `200` 和 `ok:true`，再执行下面的 capability/session 与数据面验证。
+4. 访问 `https://<your-worker>.<subdomain>.workers.dev/healthz`，确认 `200`，再执行下方数据面探针，验证密钥、中继绑定和上游连接。
 
-> **运行时 Secret 必须设置在 Worker 的 Variables & Secrets 中。** Build variables and secrets 只供构建使用；仅在那里添加 `PROXY_SECRET`，运行时无法读取。首次部署到配置 Secret 之前，`/readyz` 返回 `503` 属于预期。[Cloudflare 官方说明](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)
+> **运行时 Secret 必须设置在 Worker 的 Variables & Secrets 中。** Build variables and secrets 只供构建使用；仅在那里添加 `PROXY_SECRET`，运行时无法读取。未正确配置时，即使 `/healthz` 返回 `200`，也不会签发代理会话。[Cloudflare 官方说明](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)
 
 > 导入部署会创建 `RELAY` Durable Object（`personal-telegram-relay-v1`），无需额外数据库。
 
@@ -122,6 +133,7 @@ npx wrangler deployments list --config ../wrangler.toml
 
 - 控制台：[Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages) → 你的 Worker → **Settings → Triggers → Add Custom Domain**
 - 或在 `wrangler.toml` 加 `routes` 后重新 `deploy`，详见 [自定义域名文档](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
+- 自定义域名生效后，在根配置设置 `workers_dev = false` 并重新部署，避免 `workers.dev` 入口绕过仅施加于自定义域名的 WAF 规则。预览 URL 已默认关闭。
 
 > 域名费用不计入本项目 `$0` 基础设施约束。
 
@@ -132,7 +144,7 @@ npx wrangler deployments list --config ../wrangler.toml
 1. 先 Fork 仓库，再打开 [Workers & Pages → Create](https://dash.cloudflare.com/?to=/:account/workers-and-pages/create) → **Import from Git**，选择自己的 Fork。
 2. 项目路径使用仓库根目录 `/`，构建命令为 `npm --prefix app ci`，部署命令为 `npm --prefix app run deploy`；根 `wrangler.toml` 声明 `RELAY` binding 与 SQLite DO migration。
 3. 部署后在该 Worker 的 **Settings → Variables & Secrets** 添加运行时 Secret `PROXY_SECRET`，保存发布。
-4. 检查 `/readyz`，再执行下方完整探针。
+4. 检查 `/healthz`，再执行下方完整探针。
 
 > 不支持只在在线编辑器粘贴 `app/src/*.js`：那样不会自动创建 Durable Object binding 和 migration。
 
@@ -144,32 +156,15 @@ npx wrangler deployments list --config ../wrangler.toml
 
 ```bash
 curl https://<你的host>/healthz  # 仅检查 Worker 入口存活
-curl https://<你的host>/readyz   # 检查运行时 Secret 格式和 RELAY 可用性
-# 配置就绪：200 {"ok":true,"service":"telegram-web-proxy"}
-# 缺少/错误 Secret 或 RELAY 不可用：readyz 返回 503
-# readyz 不验证 Telegram 上游数据面；继续执行下方探针
+# /readyz 不对公网开放；运行时 Secret、中继和上游请用下方探针验证
 ```
-
-#### 能力验证（浏览器）
-
-1. 在 `app` 目录中计算 `capability`（或用探针自动算）：
-
-```js
-import { computeCapability } from './src/capability.js';
-const host = '<你的host>'; // 如 telegram-web-proxy.xxx.workers.dev
-const secretHex = '<你的PROXY_SECRET>';
-const cap = computeCapability(host, secretHex);
-console.log(`https://${host}/?bridge=${cap}`);
-```
-
-2. 浏览器打开该链接，应返回带 `bootstrap="..."` 的桥接页（`200` + `cache-control: no-store` + `content-security-policy: script-src 'nonce-...'`）
 
 #### 数据面往返探针（无需 Telegram 账号）
 
 ```bash
 # 在 app 目录下
-TASK_PROXY_SECRET=<你的PROXY_SECRET> TASK_PROXY_HOST=<你的host> npm run probe
-# 等价：TASK_PROXY_SECRET=<你的PROXY_SECRET> npm run probe -- https://<你的host>
+TASK_PROXY_SECRET=<你的PROXY_SECRET> TASK_PROXY_HOST=<你的host>/my-relay npm run probe
+# 等价：TASK_PROXY_SECRET=<你的PROXY_SECRET> npm run probe -- https://<你的host>/my-relay
 # 预期: {"result":"public-respq-pass","relay":{"ok":true,"constructor":85285459, ...}}
 # 85285459 = 0x05162463 (resPQ)
 ```
@@ -178,7 +173,7 @@ PowerShell：
 
 ```powershell
 $env:TASK_PROXY_SECRET = '<你的PROXY_SECRET>'
-$env:TASK_PROXY_HOST = '<你的host>'
+$env:TASK_PROXY_HOST = '<你的host>/my-relay'
 npm run probe
 ```
 
@@ -188,9 +183,9 @@ npm run probe
 
 | 现象 | 原因 |
 |---|---|
-| `TASK_PROXY_HOST ... required` | 未提供自己的部署 host；设置 `TASK_PROXY_HOST` 或把 HTTPS host 作为 CLI 参数 |
-| `bridge-failed` | `TASK_PROXY_SECRET` 与 Cloudflare 上 `PROXY_SECRET` 不一致，或 `TASK_PROXY_HOST` 拼错 |
-| `session-failed` | 桥接页 bootstrap 过期（120s），重新打开 `/?bridge=...` |
+| `TASK_PROXY_HOST ... required` | 未提供自己的代理地址；设置 `TASK_PROXY_HOST` 或通过 CLI 传入 `域名/路径` |
+| `bridge-failed` | 核对密钥、域名和路径（含大小写），以及目标桥接入口是否启用 |
+| `session-failed` | 检查 bootstrap 是否过期（120 秒），重新跑探针 |
 | `public-respq-fail` / 超时 | 出站 Telegram WSS 被网络拦截，等待 20s 后重试；检查 `wrangler tail` 日志 |
 
 实时日志：
@@ -204,18 +199,18 @@ npx wrangler tail --config ../wrangler.toml   # 需 RELAY_DEBUG=1 才有详细 r
 
 ## 在 Telegram Desktop 中使用
 
-> 基线：**Telegram Desktop v7.1.2**（`tdesktop` 固定提交已验证）。官方 Android `DrKLO/Telegram` 与 iOS 在核查的提交中未包含 WEB Proxy 实现，请以 Desktop 为准。
+> **Telegram Desktop v7.1.2** 是传输协议源码的核对基线。默认的桥接 v2 需要支持 `域名/路径` 的 WEB Proxy 客户端；官方 Android 12.10.4 源码已包含这项功能，但本项目未做 Android 真机验证。只支持域名的客户端需要显式开启根路径 v1。
 >
 > 以下是当前实验性接入步骤；真实 Desktop 文本、媒体和文件 E2E 尚未形成通过证据。
 
-1. 先完成部署就绪与数据面探针检查。普通浏览器直接打开 bridge 页面仅用于诊断；没有客户端 MessagePort 或注入桥初始化时，页面不会创建代理 session。
+1. 先完成健康检查与数据面探针。无需在普通浏览器打开桥接链接。
 2. Telegram Desktop：**设置 → 数据和存储 → 代理 → 添加代理 → WEB Proxy**
 3. 填入：
-   - **主机**：`<你的host>`（不含 `https://`，如 `telegram-web-proxy.xxx.workers.dev`）
+   - **地址**：`<你的host>/my-relay`（替换为你配置的路径，不含 `https://` 或末尾 `/`）；仅当启用根路径 v1 时才可只填域名。
    - **密钥**：与 `PROXY_SECRET` 完全相同的 hex（`dd` 前缀如有也填入）
 4. 点击添加并启用；当前验收目标是状态变为 **已连接**，再依次验证 Saved Messages 文本、图片和文件，结果必须单独记录，不能由单元测试代替
 
-> 代理客户端需要加载桥接页并初始化受信任的 MessagePort 或注入桥；无需把独立浏览器空白标签页当作连接条件。桥接页通过 `postMessage` + `tproxy-v1.<session-token>` 建立 `wss://<host>/api/v1/ws`，`HELLO(0x10)` → `WELCOME(0x11)` 后即进入多路复用。
+> 桥接页、会话 API 和 WebSocket 都走同一个路径前缀，例如 `wss://<host>/my-relay/api/v1/ws`。桥接 v2 不更改 `tproxy-v1.<session-token>` 或现有帧协议。
 
 ---
 
@@ -223,7 +218,10 @@ npx wrangler tail --config ../wrangler.toml   # 需 RELAY_DEBUG=1 才有详细 r
 
 | 变量 | 位置 | 说明 |
 |---|---|---|
-| `PROXY_SECRET` | `wrangler secret` / 控制台 Secret | 32 位 hex 或 `dd`+32 位，唯一凭证 |
+| `PROXY_SECRET` | `wrangler secret` / 控制台 Secret | 必填；16 字节随机值的 32 位 hex，可加 `dd` 前缀 |
+| `PROXY_BASE_PATH` | Wrangler vars / 控制台普通变量 | 桥接 v2 的入口路径，如 `my-relay` 或 `team/Relay`；无首尾 `/`，区分大小写，最多 128 字符。每段以英文字母或数字开头，后续可含 `-` 或 `_`。 |
+| `PROXY_ALLOW_ROOT_V1` | Wrangler vars / 控制台普通变量 | 默认 `false`；设为 `true` 才允许根路径桥接。只接受 `true` / `false`（布尔值或同名字符串）。 |
+| `RELAY_ALLOWED_IPS` | 控制台普通变量 / Wrangler vars | 可选；逗号分隔的公网 IPv4/IPv6 地址。不设置时不限制来源；不要填空字符串或 CIDR。固定公网出口时推荐启用，换网后需更新。用 Wrangler 重新部署时，请在配置中保留该变量，或配置 `keep_vars = true` 保留控制台变量。 |
 | `RELAY_DEBUG` | `wrangler vars` / 控制台 Variable | `1` 开启详细中继日志（`wrangler tail` 可见） |
 
 根目录 [`wrangler.toml`](wrangler.toml) 是部署、本地开发、运行时测试与 CI 的唯一 Wrangler 配置来源；`app/package.json` 与 `app/vitest.config.js` 均显式引用它。完整 binding、migration、兼容日期和日志策略直接以该文件为准。
@@ -244,11 +242,11 @@ npm --prefix app run lint
 
 # 本地 Cloudflare 运行时
 npm --prefix app run dev
-# → http://127.0.0.1:8792；healthz/普通首页可直接访问
+# → http://127.0.0.1:8792；healthz 可直接访问
 # capability 依赖公共 hostname；完整 bridge/session/WSS 本地合同由 test:runtime 覆盖
 
 # 已部署 Worker 的公网探针
-TASK_PROXY_SECRET=<hex> TASK_PROXY_HOST=<你的host> npm --prefix app run probe
+TASK_PROXY_SECRET=<hex> TASK_PROXY_HOST=<你的host>/my-relay npm --prefix app run probe
 ```
 
 ### 项目结构
@@ -279,13 +277,14 @@ wrangler.toml               # 唯一 Wrangler 配置；所有部署与测试入�
 
 ## 安全模型
 
-- 密钥与令牌：`randomBytes(32)` → `base64url` 43 字符；lookup key 使用 SHA-256；原始 session token 仅在活跃内存和响应中存在
-- 能力比较：`timingSafeEqual` + 规范化主机名
+- 桥接链接：根路径 v1 绑定主机名，带路径 v2 额外绑定路径；两种 `?bridge=…` 都由密钥确定性生成，**本身不过期**。不要把它放进浏览器、截图或日志；若泄漏，轮换密钥。有固定公网出口时可启用 `RELAY_ALLOWED_IPS`。
+- 短期令牌：43 字符格式不变，约 120 秒有效，签名绑定主机、入口路径和用途；Worker 在访问 DO 前拒绝无效令牌，DO 再确认签发和撤销状态。接入 WebSocket 后，bootstrap 立即撤销；令牌过期不影响已建立的连接。
 - 主机规范化：`domainToASCII`、小写、标签校验，拒绝 IP/纯数字 TLD/裸主机
 - 帧校验：文本载体、未知类型、非法流 ID、超大载荷 → 立即 `1002` 关闭载体
 - 无载荷持久化：`bootstrap / session / MTProto 字节` 绝不写入 Durable Storage
-- 日志：关闭会记录完整 URL/query 的 invocation logs；自定义 relay 日志不含 secret、token 或 payload
-- 资源边界：DO 级共享 pending/outstanding byte+item 预算、bootstrap/session 容量、4 路拨号和最多 256 个可取消等待任务；流 ID 位图每 session 最多 2 MiB
+- 日志：默认关闭 invocation logs 和 traces。不要在 Logpush/Tail 或排障材料中留存完整 URL、`Authorization`、`X-Bootstrap-Token`、`X-Session-Token` 或含令牌的 `Sec-WebSocket-Protocol`。
+- 资源边界：每个 Cloudflare 边缘位置约 30 次/分钟/来源 IP、合计 120 次/分钟进入 DO（不是全球硬配额，也不保护 Worker 入口请求额度）；最多 8 个会话。接入后 20 秒内须完成首个 MTProxy 初始化；4 次无效初始化或 15 分钟无转发流量会关闭载体。每会话每方向还有 8 MiB/s 的字节限制及每秒 8192 帧的限制，超限关闭载体。若用自定义域名，可另在 WAF 层限制请求进入 Worker。
+- 出站只使用固定 Telegram 主机，拒绝重定向。独立验证 Worker 不随主项目部署；如有需要，使用独立的随机 `PROBE_TOKEN`（`randomBytes(32).toString('base64url')`），只在验证期间启用。
 - 桥接页 CSP：`default-src 'none'`、`script-src 'nonce-…'`、`frame-ancestors http://127.0.0.1:*`（Desktop WebView）、`sandbox allow-same-origin allow-scripts`
 
 ---
@@ -296,7 +295,7 @@ wrangler.toml               # 唯一 Wrangler 配置；所有部署与测试入�
 - 个人单用户使用，不做多租户/管理后台/付费扩容
 - 不支持 `ee` TLS 伪装密钥与任意上游目标选择
 - 活跃 cipher 状态只在内存；明确使用 standard WebSocket，不支持通过 hibernation 恢复 cipher；DO 驱逐或载体丢失需要重建整个 session；单个上游 `1006` 关闭对应逻辑流
-- Cloudflare outbound WebSocket `send()` 不提供 drain/ack；应用队列已严格有界，但大文件可靠性仍需真实 soak 验证
+- Cloudflare outbound WebSocket `send()` 不提供 drain/ack；能读取 `bufferedAmount` 时检查发送积压，其他情况下靠速率与应用队列限额降低风险。运行时缓冲和大文件可靠性仍需真实 soak 验证
 - `websocket-lanes` 与 raw-TCP 回退为 deferred，仅在单载体 HOL/吞吐或 WSS 兼容门失败时启用
 
 ---
@@ -310,7 +309,7 @@ A: 单 128 MB DO 全天理论值约 11.06k GB-s，占 13k 日额度约 85%；剩
 A: 均可。`workers.dev` 零成本即开；自定义域名需 Cloudflare 托管域，但更稳定、能力 host 更可控。
 
 **Q: 部署后 Telegram 连不上？**  
-A: 依次检查：`PROXY_SECRET` 是否一致（含 `dd`）、`host` 是否规范化后一致、bootstrap 是否在 120s 内使用、`wrangler tail` 是否有 `protocolError`。
+A: 依次检查 `PROXY_SECRET`（含 `dd`）、代理主机名、当前出口是否在启用的 IP 白名单内，以及 bootstrap 是否在 120 秒内使用。先跑数据面探针，不要保存或共享包含完整请求 URL 或凭证的输出。
 
 ---
 

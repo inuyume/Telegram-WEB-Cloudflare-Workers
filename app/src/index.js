@@ -9,28 +9,28 @@
  * - Enforces bounded flow control and constant-time secret comparison
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { isIP } from 'node:net';
 import { DurableObject } from 'cloudflare:workers';
 
-import { matchesBridgeCapability } from './capability.js';
-import { parseProxySecret } from './mtproxy.js';
+import { isProxyBasePath, matchesBridgeCapability } from './capability.js';
 import { bridgePage } from './bridge.js';
+import { deployableSecret, mintToken, TOKEN_TTL_MS, verifyToken } from './credentials.js';
 import { decodeFrames, encodeFrame, FRAME_TYPES } from './protocol.js';
 import {
   DialLimiter,
   openTelegramWss,
   RelayBudget,
   RelayEngine,
+  sendBounded,
 } from './relay.js';
 
 export { encodeFrame, FRAME_TYPES } from './protocol.js';
 export { computeCapability, normalizeWebProxyHost } from './capability.js';
 
-/** Bootstrap token TTL — single-use, 120s */
-const BOOTSTRAP_TTL_MS = 120_000;
-/** Unattached session must bind its carrier promptly. */
-const SESSION_ATTACH_TTL_MS = BOOTSTRAP_TTL_MS;
 const MAX_BOOTSTRAPS = 64;
 const MAX_SESSIONS = 8;
+const CARRIER_INIT_MS = 20_000;
+const CARRIER_IDLE_MS = 15 * 60_000;
 /** Singleton DO name for the personal relay */
 const PROXY_OBJECT_NAME = 'personal-telegram-relay-v1';
 
@@ -55,9 +55,55 @@ function busy() {
   });
 }
 
-function validApiRequest(request, url) {
-  if (url.search) return false;
-  if (url.pathname === '/api/v1/session') {
+async function limitRelayRequest(request, env) {
+  try {
+    // CF-Connecting-IP is supplied by the edge. Never key on a presented token
+    // or X-Forwarded-For, and share limits across all hostnames of this Worker.
+    const ip = normalizedIp(request.headers.get('CF-Connecting-IP') || '') || 'unknown';
+    const client = await env.RELAY_CLIENT_LIMIT.limit({ key: ip });
+    if (client.success && (await env.RELAY_EDGE_LIMIT.limit({ key: PROXY_OBJECT_NAME })).success) return null;
+    return new Response('Too many requests', {
+      status: 429, headers: { 'cache-control': 'no-store', 'retry-after': '60' },
+    });
+  } catch { return busy(); }
+}
+
+function normalizedIp(value) {
+  if (value.includes('%')) return ''; // No IPv6 zone IDs in a public source address.
+  const family = isIP(value);
+  if (family === 4) return value;
+  if (family === 6) return new URL(`http://[${value}]/`).hostname;
+  return '';
+}
+
+function permitsClient(request, env) {
+  if (env.RELAY_ALLOWED_IPS === undefined) return true;
+  const client = normalizedIp(request.headers.get('CF-Connecting-IP') || '');
+  const allowed = String(env.RELAY_ALLOWED_IPS).split(',').map(value => normalizedIp(value.trim()));
+  return Boolean(client) && allowed.every(Boolean) && allowed.includes(client);
+}
+
+function proxyRoute(pathname, env) {
+  const flag = env.PROXY_ALLOW_ROOT_V1;
+  const allowRoot = flag === true || flag === 'true';
+  if (!allowRoot && flag !== undefined && flag !== false && flag !== 'false') return null;
+  const configured = env.PROXY_BASE_PATH === undefined ? '' : env.PROXY_BASE_PATH;
+  if (configured !== '' && !isProxyBasePath(configured)) return null;
+  // Check exact endpoint paths, including the bridge's required trailing slash.
+  for (const basePath of [configured || null, allowRoot ? '' : null]) {
+    if (basePath === null) continue;
+    const prefix = basePath ? `/${basePath}` : '';
+    if (!pathname.startsWith(`${prefix}/`)) continue;
+    const endpoint = pathname.slice(prefix.length);
+    if (endpoint === '/' || endpoint === '/api/v1/session' || endpoint === '/api/v1/ws') {
+      return { basePath, endpoint };
+    }
+  }
+  return null;
+}
+
+function validApiRequest(request, endpoint) {
+  if (endpoint === '/api/v1/session') {
     if (request.headers.has('Cookie') || !bearer(request.headers.get('Authorization'))) return false;
     if (request.method === 'DELETE') return true;
     if (request.method !== 'POST'
@@ -65,7 +111,7 @@ function validApiRequest(request, url) {
     const length = request.headers.get('Content-Length');
     return length === null || (/^\d+$/.test(length) && Number(length) <= 64);
   }
-  if (url.pathname === '/api/v1/ws') {
+  if (endpoint === '/api/v1/ws') {
     return request.method === 'GET'
       && request.headers.get('Upgrade')?.toLowerCase() === 'websocket'
       && parseCarrierProtocol(request.headers.get('Sec-WebSocket-Protocol') || '') !== null;
@@ -112,14 +158,6 @@ export async function readBodyAtMost(request, maxBytes, timeoutMs = 10_000) {
   }
 }
 
-function hasRuntimeSecret(env) {
-  try { parseProxySecret(env.PROXY_SECRET); return true; } catch { return false; }
-}
-
-function randomToken() {
-  return randomBytes(32).toString('base64url');
-}
-
 function tokenHash(token) {
   return createHash('sha256').update(token).digest('hex');
 }
@@ -131,13 +169,11 @@ export function parseCarrierProtocol(protocol) {
   return { token };
 }
 
-function validRootCapability(request, env) {
-  const url = new URL(request.url);
-  if (url.pathname !== '/' || request.method !== 'GET') return false;
-  const entries = [...url.searchParams.entries()];
-  if (entries.length !== 1 || entries[0][0] !== 'bridge') return false;
-  const value = entries[0][1];
-  return matchesBridgeCapability(value, url.hostname, env.PROXY_SECRET);
+function validBridgeCapability(url, secret, basePath) {
+  if (!secret) return false;
+  const { searchParams } = url;
+  return searchParams.size === 1
+    && matchesBridgeCapability(searchParams.get('bridge'), url.hostname, secret.toString('hex'), basePath);
 }
 
 export async function handleRequest(request, env) {
@@ -145,27 +181,31 @@ export async function handleRequest(request, env) {
   if (url.pathname === '/healthz' && request.method === 'GET') {
     return json({ ok: true, service: 'telegram-web-proxy' });
   }
-  if (url.pathname === '/readyz' && request.method === 'GET') {
-    let ok = false;
-    if (hasRuntimeSecret(env) && typeof env.RELAY?.getByName === 'function') {
-      try {
-        const response = await env.RELAY.getByName(PROXY_OBJECT_NAME).fetch(new Request('https://relay/internal/readyz'));
-        ok = response.ok;
-        void response.body?.cancel().catch(() => {});
-      } catch {}
+  if (url.protocol !== 'https:') return notFound();
+  if (!permitsClient(request, env)) return notFound();
+  const route = proxyRoute(url.pathname, env);
+  if (!route) return notFound();
+  const { basePath, endpoint } = route;
+  if (endpoint === '/' && request.method === 'GET') {
+    const secret = url.search ? deployableSecret(env.PROXY_SECRET) : null;
+    if (!validBridgeCapability(url, secret, basePath)) {
+      if (basePath) return notFound();
+      return new Response('<!doctype html><title>Telegram WEB Proxy</title><p>Telegram WEB Proxy</p>', {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+      });
     }
-    return json({ ok, service: 'telegram-web-proxy' }, { status: ok ? 200 : 503 });
-  }
-  if (validRootCapability(request, env)) {
-    const bootstrap = randomToken();
+    const limited = await limitRelayRequest(request, env);
+    if (limited) return limited;
+    const bootstrap = mintToken(secret, 'bootstrap', url.hostname, basePath);
     const relay = env.RELAY.getByName(PROXY_OBJECT_NAME);
     const response = await relay.fetch(new Request('https://relay/internal/bootstrap', {
       method: 'POST',
       headers: { 'X-Bootstrap-Token': bootstrap },
     }));
-    if (!response.ok) return notFound();
+    if (!response.ok) return response.status === 503 ? busy() : notFound();
     const nonce = randomBytes(18).toString('base64url');
-    const page = bridgePage(url.hostname, bootstrap, nonce);
+    const page = bridgePage(url.hostname, bootstrap, nonce, basePath);
     return new Response(page.body, {
       status: 200,
       headers: {
@@ -178,13 +218,14 @@ export async function handleRequest(request, env) {
       },
     });
   }
-  if (url.pathname === '/' && request.method === 'GET') {
-    return new Response('<!doctype html><title>Telegram WEB Proxy</title><p>Telegram WEB Proxy</p>', {
-      status: 200,
-      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
-    });
-  }
-  if (!validApiRequest(request, url)) return notFound();
+  if (url.search || !validApiRequest(request, endpoint)) return notFound();
+  const token = endpoint === '/api/v1/ws'
+    ? parseCarrierProtocol(request.headers.get('Sec-WebSocket-Protocol')).token
+    : bearer(request.headers.get('Authorization'));
+  const purpose = request.method === 'POST' ? 'bootstrap' : 'session';
+  if (!verifyToken(token, deployableSecret(env.PROXY_SECRET), purpose, url.hostname, basePath)) return notFound();
+  const limited = await limitRelayRequest(request, env);
+  if (limited) return limited;
   return env.RELAY.getByName(PROXY_OBJECT_NAME).fetch(request);
 }
 
@@ -206,17 +247,18 @@ export class RelayDO extends DurableObject {
       onOutstandingAvailable: () => this.flushRelayDown(),
     });
     this.dialLimiter = new DialLimiter();
+    this.schedule = env.__setTimeout ?? setTimeout;
+    this.cancelTimer = env.__clearTimeout ?? clearTimeout;
+    this.initMs = env.__carrierTimeouts?.initMs ?? CARRIER_INIT_MS;
+    this.idleMs = env.__carrierTimeouts?.idleMs ?? CARRIER_IDLE_MS;
   }
 
   async fetch(request) {
     const url = new URL(request.url);
-    if (url.pathname === '/internal/readyz') {
-      const ok = hasRuntimeSecret(this.env);
-      return json({ ok }, { status: ok ? 200 : 503 });
-    }
     if (url.pathname === '/internal/bootstrap') return this.issueBootstrap(request);
-    if (url.pathname === '/api/v1/session') return this.session(request);
-    if (url.pathname === '/api/v1/ws') return this.attachWebSocket(request);
+    const route = proxyRoute(url.pathname, this.env);
+    if (route?.endpoint === '/api/v1/session') return this.session(request, route.basePath);
+    if (route?.endpoint === '/api/v1/ws') return this.attachWebSocket(request);
     if (url.pathname === '/healthz') return json({ ok: true, bootId: this.bootId });
     return notFound();
   }
@@ -235,7 +277,7 @@ export class RelayDO extends DurableObject {
     return new Response(null, { status: 204 });
   }
 
-  async session(request) {
+  async session(request, basePath = '') {
     this.sweepExpiredBootstraps();
     this.sweepExpiredSessions();
     const token = bearer(request.headers.get('Authorization'));
@@ -249,21 +291,23 @@ export class RelayDO extends DurableObject {
     }
     if (request.method !== 'POST' || request.headers.get('Content-Type') !== 'application/octet-stream') return notFound();
     const bootstrap = this.bootstraps.get(hash);
-    if (!bootstrap || Date.now() - bootstrap.createdAt > BOOTSTRAP_TTL_MS) return notFound();
+    if (!bootstrap || Date.now() - bootstrap.createdAt >= TOKEN_TTL_MS) return notFound();
     const body = await readBodyAtMost(request, 64);
     if (body === null || this.bootstraps.get(hash) !== bootstrap
-      || Date.now() - bootstrap.createdAt > BOOTSTRAP_TTL_MS) return notFound();
+      || Date.now() - bootstrap.createdAt >= TOKEN_TTL_MS) return notFound();
     let frames;
     try { frames = decodeFrames(body); } catch { return notFound(); }
     if (frames.length !== 1 || frames[0].type !== FRAME_TYPES.HELLO || frames[0].streamId !== 0 || Buffer.compare(frames[0].payload, Buffer.of(1)) !== 0) return notFound();
     const fingerprint = Buffer.from(body).toString('base64url');
     const existing = this.sessions.get(hash);
     if (existing) {
-      if (existing.fingerprint !== fingerprint) return notFound();
+      if (existing.socket || existing.fingerprint !== fingerprint) return notFound();
       return this.sessionResponse(existing.token, existing.welcome);
     }
     if (this.sessionSet.size >= MAX_SESSIONS) return busy();
-    const sessionToken = randomToken();
+    const secret = deployableSecret(this.env.PROXY_SECRET);
+    if (!secret) return notFound();
+    const sessionToken = mintToken(secret, 'session', new URL(request.url).hostname, basePath);
     const welcome = encodeFrame(FRAME_TYPES.WELCOME, 0);
     const session = {
       token: sessionToken,
@@ -295,13 +339,13 @@ export class RelayDO extends DurableObject {
 
   sweepExpiredBootstraps(now = Date.now()) {
     for (const [hash, bootstrap] of this.bootstraps) {
-      if (now - bootstrap.createdAt > BOOTSTRAP_TTL_MS) this.bootstraps.delete(hash);
+      if (now - bootstrap.createdAt >= TOKEN_TTL_MS) this.bootstraps.delete(hash);
     }
   }
 
   sweepExpiredSessions(now = Date.now()) {
     for (const session of this.sessionSet) {
-      if (!session.socket && now - session.createdAt > SESSION_ATTACH_TTL_MS) {
+      if (!session.socket && now - session.createdAt >= TOKEN_TTL_MS) {
         this.disposeSession(session, 'session expired');
       }
     }
@@ -318,13 +362,15 @@ export class RelayDO extends DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     session.socket = server;
+    this.bootstraps.delete(session.bootstrapHash);
+    this.sessions.delete(session.bootstrapHash);
     const dialTelegram = this.env.__dialTelegram
       ?? ((target, options) => openTelegramWss(target, { ...options, fetchImpl: this.env.__fetch ?? fetch }));
     session.engine = new RelayEngine({
       secret: this.env.PROXY_SECRET,
       randomBytes: this.env.__randomBytes,
       dialTelegram,
-      sendCarrier: (frame) => server.send(frame),
+      sendCarrier: (frame) => sendBounded(server, frame),
       closeCarrier: (code, reason) => {
         try { server.close?.(code, reason); }
         finally { this.disposeSession(session, reason, false); }
@@ -332,6 +378,8 @@ export class RelayDO extends DurableObject {
       debug: this.env.RELAY_DEBUG === '1',
       budget: this.relayBudget,
       dialLimiter: this.dialLimiter,
+      onAuthenticated: () => this.markAuthenticated(session),
+      onTraffic: () => { session.lastTrafficAt = Date.now(); },
     });
     this.sockets.set(server, session);
     try { server.binaryType = 'arraybuffer'; } catch {}
@@ -344,6 +392,7 @@ export class RelayDO extends DurableObject {
     }
     server.addEventListener?.('close', () => this.detach(server));
     server.addEventListener?.('error', () => this.detach(server));
+    this.armCarrierTimer(session, this.initMs);
     const protocol = `tproxy-v1.${session.token}`;
     try {
       return new Response(null, {
@@ -376,6 +425,7 @@ export class RelayDO extends DurableObject {
       session.engine.protocolError(msg || 'protocol error');
       return;
     }
+    if (!session.engine.acceptCarrierBatch(message.byteLength, frames.length)) return;
     for (const frame of frames) {
       if (frame.streamId === 0) {
         session.engine.protocolError('unsupported frame');
@@ -404,8 +454,31 @@ export class RelayDO extends DurableObject {
     this.disposeSession(session, 'carrier detached');
   }
 
+  markAuthenticated(session) {
+    if (session.lastTrafficAt !== undefined) return;
+    session.lastTrafficAt = Date.now();
+    this.armCarrierTimer(session, this.idleMs);
+  }
+
+  armCarrierTimer(session, delay) {
+    this.cancelTimer(session.timer);
+    session.timer = this.schedule(() => {
+      if (!session.engine) return;
+      if (session.lastTrafficAt === undefined) {
+        session.engine.terminateCarrier(1008, 'MTProxy initialization deadline');
+        return;
+      }
+      const remaining = session.lastTrafficAt + this.idleMs - Date.now();
+      if (remaining > 0) this.armCarrierTimer(session, remaining);
+      else session.engine.terminateCarrier(1008, 'carrier idle');
+    }, delay);
+    session.timer?.unref?.();
+  }
+
   disposeSession(session, reason, closeSocket = true) {
     const engine = session.engine, socket = session.socket;
+    this.cancelTimer(session.timer);
+    session.timer = undefined;
     session.engine = null;
     session.socket = null;
     if (socket) this.sockets.delete(socket);

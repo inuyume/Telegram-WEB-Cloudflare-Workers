@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
+import { timingSafeEqual } from 'node:crypto';
 
 import {
   TELEGRAM_HOSTS,
@@ -6,6 +7,7 @@ import {
 } from '../../../shared/telegram-dc.js';
 
 const PROBE_OBJECT_NAME = 'personal-telegram-relay-validation-v1';
+const PROBE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export { telegramHostForDc } from '../../../shared/telegram-dc.js';
 
@@ -34,6 +36,7 @@ async function openTelegramWss(host, { timeoutMs = 10000 } = {}) {
   const started = Date.now();
   try {
     const response = await fetch(`https://${host}/apiws`, {
+      redirect: 'manual',
       headers: {
         Upgrade: 'websocket',
         'Sec-WebSocket-Protocol': 'binary',
@@ -42,7 +45,9 @@ async function openTelegramWss(host, { timeoutMs = 10000 } = {}) {
     });
     const protocol = response.headers.get('Sec-WebSocket-Protocol');
     if (response.status !== 101 || protocol !== 'binary' || !response.webSocket) {
-      throw new Error(`Telegram WSS handshake failed: ${response.status}/${protocol ?? 'none'}`);
+      void response.body?.cancel().catch(() => {});
+      try { response.webSocket?.close(); } catch {}
+      throw new Error(`Telegram WSS handshake failed: ${response.status}`);
     }
     clearTimeout(timeout);
     timeout = null;
@@ -74,19 +79,29 @@ async function dialTelegramWss(host, { holdMs = 0, timeoutMs = 10000 } = {}) {
 }
 
 export async function handleRequest(request, env) {
-  const { pathname } = new URL(request.url);
+  const { pathname, protocol } = new URL(request.url);
   if (pathname === '/healthz') {
     return json({
       ok: true,
       service: 'telegram-web-proxy-cloudflare-probe',
     });
   }
-  if (!pathname.startsWith('/probe/')) {
+  if (protocol !== 'https:' || !pathname.startsWith('/probe/')) {
     return notFound();
   }
-  if (!env.PROBE_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.PROBE_TOKEN}`) {
+  const expected = env.PROBE_TOKEN;
+  const authorization = request.headers.get('Authorization') || '';
+  if (typeof expected !== 'string' || !PROBE_TOKEN_PATTERN.test(expected)
+    || !authorization.startsWith('Bearer ') || !PROBE_TOKEN_PATTERN.test(authorization.slice(7))
+    || !timingSafeEqual(Buffer.from(authorization.slice(7)), Buffer.from(expected))) {
     return notFound();
   }
+
+  try {
+    if (!(await env.PROBE_LIMIT.limit({ key: PROBE_OBJECT_NAME })).success) {
+      return json({ ok: false }, { status: 429, headers: { 'retry-after': '60' } });
+    }
+  } catch { return json({ ok: false }, { status: 503 }); }
 
   return env.RELAY_PROBE.getByName(PROBE_OBJECT_NAME).fetch(request);
 }

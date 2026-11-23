@@ -1,6 +1,19 @@
 name = "telegram-web-proxy-validation-probe"
 main = "src/index.js"
 compatibility_date = "2026-08-25"
+compatibility_flags = ["nodejs_compat"]
+preview_urls = false
+
+[observability.logs]
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[[ratelimits]]
+name = "PROBE_LIMIT"
+namespace_id = "92003"
+simple = { limit = 12, period = 60 }
 
 [[durable_objects.bindings]]
 name = "RELAY_PROBE"

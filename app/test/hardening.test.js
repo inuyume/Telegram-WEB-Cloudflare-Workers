@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
-import { createCipheriv } from 'node:crypto';
+import { createCipheriv, randomBytes } from 'node:crypto';
 import test from 'node:test';
 
 import * as entry from '../src/index.js';
+import { deployableSecret, mintToken, TOKEN_TTL_MS, verifyToken } from '../src/credentials.js';
 import { DialLimiter, RelayBudget, RelayEngine, openTelegramWss } from '../src/relay.js';
 import { deriveProxyKeyMaterial } from '../src/mtproxy.js';
 import { decodeFrames, encodeFrame, FRAME_TYPES } from '../src/protocol.js';
 
 const SECRET = '000102030405060708090a0b0c0d0e0f';
+const DEPLOY_SECRET = randomBytes(16).toString('hex');
+const HOST = 'relay.example.com';
+const request = (path, init) => new Request(`https://${HOST}${path}`, init);
+const allow = { limit: async () => ({ success: true }) };
 const frame = (type, streamId, payload = Buffer.alloc(0)) => ({ type, streamId, payload });
 const turn = () => new Promise(resolve => setImmediate(resolve));
 const socket = () => ({ send() {}, close() {}, addEventListener() {} });
@@ -201,19 +206,143 @@ test('session body reader cancels a stalled body under a hard deadline', async (
   assert.equal(cancelled, true);
 });
 
-test('readiness fails without a runtime secret or reachable relay, while health stays live', async () => {
+test('public readiness is disabled, while health stays live without a Durable Object', async () => {
   const health = await entry.handleRequest(new Request('https://relay.example.com/healthz'), {});
   assert.equal(health.status, 200);
-  for (const env of [{}, { PROXY_SECRET: SECRET }, { PROXY_SECRET: 'bad', RELAY: {} }]) {
-    const response = await entry.handleRequest(new Request('https://relay.example.com/readyz'), env);
-    assert.equal(response.status, 503);
-    assert.equal((await response.json()).ok, false);
-  }
-  const relay = new entry.RelayDO({}, { PROXY_SECRET: SECRET });
   const response = await entry.handleRequest(new Request('https://relay.example.com/readyz'), {
-    PROXY_SECRET: SECRET, RELAY: { getByName: () => relay } });
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).ok, true);
+    get RELAY() { assert.fail('public readiness must not access relay'); },
+  });
+  assert.equal(response.status, 404);
+});
+
+test('server bearer is short lived and bound to its purpose, host and deployment key', () => {
+  const secret = deployableSecret(DEPLOY_SECRET);
+  const now = 1_000_000;
+  const token = mintToken(secret, 'bootstrap', HOST, '', now);
+  assert.match(token, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(verifyToken(token, secret, 'bootstrap', HOST, '', now + TOKEN_TTL_MS - 1), true);
+  assert.equal(verifyToken(token, secret, 'bootstrap', HOST, '', now + TOKEN_TTL_MS), false);
+  assert.equal(verifyToken(token, secret, 'session', HOST, '', now), false);
+  assert.equal(verifyToken(token, secret, 'bootstrap', 'other.example.com', '', now), false);
+  assert.equal(verifyToken(token, randomBytes(16), 'bootstrap', HOST, '', now), false);
+  const changed = Buffer.from(token, 'base64url');
+  changed[31] ^= 1;
+  assert.equal(verifyToken(changed.toString('base64url'), secret, 'bootstrap', HOST, '', now), false);
+});
+
+test('production never signs a bearer under the documented sample or an all-repeated key', async () => {
+  for (const value of [SECRET, `dd${SECRET}`, '00'.repeat(16), 'ff'.repeat(16)]) {
+    assert.equal(deployableSecret(value), null);
+    const capability = entry.computeCapability(HOST, value);
+    const response = await entry.handleRequest(request(`/?bridge=${capability}`), {
+      PROXY_SECRET: value, PROXY_ALLOW_ROOT_V1: true, get RELAY() { assert.fail('must not contact relay'); },
+    });
+    assert.doesNotMatch(await response.text(), /bootstrap=/);
+  }
+});
+
+test('unverified edge tokens never enter limiters or the DO; valid ones are rate limited first', async () => {
+  const secret = deployableSecret(DEPLOY_SECRET);
+  const token = mintToken(secret, 'session', HOST);
+  const calls = [];
+  const env = {
+    PROXY_SECRET: DEPLOY_SECRET,
+    PROXY_ALLOW_ROOT_V1: true,
+    RELAY_CLIENT_LIMIT: { async limit({ key }) { calls.push(key); return { success: true }; } },
+    RELAY_EDGE_LIMIT: { async limit({ key }) { calls.push(key); return { success: false }; } },
+    get RELAY() { assert.fail('must not contact relay'); },
+  };
+  const session = t => request('/api/v1/session', {
+    method: 'DELETE', headers: { Authorization: `Bearer ${t}`, 'CF-Connecting-IP': '192.0.2.9', 'X-Forwarded-For': '192.0.2.4' },
+  });
+  for (const invalid of ['A'.repeat(43), mintToken(secret, 'bootstrap', HOST),
+    mintToken(secret, 'session', 'other.example.com'), mintToken(secret, 'session', HOST, '', Date.now() - 121_000)]) {
+    assert.equal((await entry.handleRequest(session(invalid), env)).status, 404);
+  }
+  assert.deepEqual(calls, []);
+  assert.equal((await entry.handleRequest(session(token), env)).status, 429);
+  assert.deepEqual(calls, ['192.0.2.9', 'personal-telegram-relay-v1']);
+  assert.equal((await entry.handleRequest(session(token), { PROXY_SECRET: DEPLOY_SECRET, PROXY_ALLOW_ROOT_V1: true })).status, 503);
+});
+
+test('an IP allowlist restricts credential-bearing routes across hostnames but not health', async () => {
+  const hits = [];
+  const env = {
+    PROXY_SECRET: DEPLOY_SECRET, RELAY_ALLOWED_IPS: '2001:db8::1,192.0.2.9',
+    PROXY_ALLOW_ROOT_V1: true,
+    RELAY_CLIENT_LIMIT: allow, RELAY_EDGE_LIMIT: allow,
+    RELAY: { getByName: () => ({ fetch: async () => { hits.push(1); return new Response(null, { status: 204 }); } }) },
+  };
+  for (const host of [HOST, 'alternate.example.com']) {
+    const url = `https://${host}/?bridge=${entry.computeCapability(host, DEPLOY_SECRET)}`;
+    assert.equal((await entry.handleRequest(new Request(url), env)).status, 404);
+    assert.equal((await entry.handleRequest(new Request(url, { headers: { 'X-Forwarded-For': '192.0.2.9' } }), env)).status, 404);
+    const headers = { 'CF-Connecting-IP': '2001:0db8:0000:0000:0000:0000:0000:0001' };
+    assert.equal((await entry.handleRequest(new Request(url, { headers }), env)).status, 200);
+    assert.equal((await entry.handleRequest(new Request(url, { headers }), { ...env, RELAY_ALLOWED_IPS: '' })).status, 404);
+  }
+  assert.equal(hits.length, 2);
+  assert.equal((await entry.handleRequest(request('/healthz'), env)).status, 200);
+});
+
+test('carrier rate exhaustion closes the session and releases outstanding relay resources', () => {
+  let now = 0;
+  const closes = [];
+  const engine = new RelayEngine({ secret: SECRET, now: () => now, bytesPerSecond: 128,
+    framesPerSecond: 2, sendCarrier() {}, closeCarrier: code => closes.push(code) });
+  engine.handleFrame(frame(FRAME_TYPES.OPEN, 1));
+  engine.enqueueDown(engine.streams.get(1), Buffer.alloc(8));
+  assert.equal(engine.acceptCarrierBatch(128, 2), true);
+  now = 500;
+  assert.equal(engine.acceptCarrierBatch(64, 1), true);
+  assert.equal(engine.acceptCarrierBatch(1, 1), false);
+  assert.deepEqual(closes, [1008]);
+  assert.equal(engine.budget.outstandingBytes, 0);
+  assert.equal(engine.streams.size, 0);
+});
+
+test('slow upstream cannot retain queued bytes or earn WINDOW credit when its socket is full', async () => {
+  let upstreamWrites = 0;
+  let upstreamClosed = 0;
+  const frames = [];
+  const engine = new RelayEngine({ secret: SECRET,
+    dialTelegram: async () => ({
+      bufferedAmount: 4 * 1024 * 1024,
+      send() { upstreamWrites++; }, close() { upstreamClosed++; }, addEventListener() {},
+    }),
+    sendCarrier: value => frames.push(...decodeFrames(value)), closeCarrier: () => assert.fail('stream only'),
+  });
+  engine.handleFrame(frame(FRAME_TYPES.OPEN, 1));
+  await engine.handleFrame(frame(FRAME_TYPES.DATA, 1, clientInit()));
+  assert.equal(upstreamWrites, 0);
+  assert.equal(upstreamClosed, 1);
+  assert.deepEqual(frames.map(({ type }) => type), [FRAME_TYPES.CLOSE]);
+  assert.equal(engine.budget.pendingBytes, 0);
+  assert.equal(engine.budget.pendingItems, 0);
+  assert.equal(engine.streams.size, 0);
+});
+
+test('repeated invalid MTProxy initializations terminate the carrier without dialing or refreshing idle', () => {
+  const closes = [];
+  const engine = new RelayEngine({ secret: SECRET, sendCarrier() {}, closeCarrier: code => closes.push(code),
+    dialTelegram: () => assert.fail('invalid init must not dial'), onAuthenticated: () => assert.fail('must not authenticate') });
+  for (let id = 1; id <= 4; id++) {
+    engine.handleFrame(frame(FRAME_TYPES.OPEN, id));
+    engine.handleFrame(frame(FRAME_TYPES.DATA, id, Buffer.alloc(64)));
+  }
+  assert.deepEqual(closes, [1008]);
+  assert.equal(engine.streams.size, 0);
+});
+
+test('outbound handshake never follows a redirect', async () => {
+  const seen = [];
+  await assert.rejects(openTelegramWss({ host: 'venus.web.telegram.org' }, {
+    fetchImpl: async (url, { redirect }) => {
+      seen.push([url, redirect]);
+      return Response.redirect('https://example.com');
+    },
+  }), /handshake failed/);
+  assert.deepEqual(seen, [['https://venus.web.telegram.org/apiws', 'manual']]);
 });
 
 test('outbound handshake propagates caller cancellation to fetch', async () => {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import test from 'node:test';
 import { DurableObject } from 'cloudflare:workers';
 
@@ -7,6 +8,8 @@ import {
   handleRequest,
   telegramHostForDc,
 } from '../src/index.js';
+
+const PROBE_TOKEN = randomBytes(32).toString('base64url');
 
 test('RelayProbe uses the current Cloudflare DurableObject base class', () => {
   assert.equal(RelayProbe.prototype instanceof DurableObject, true);
@@ -24,7 +27,8 @@ test('worker health endpoint is independent of the Durable Object', async () => 
 test('worker forwards internal probe routes to one deterministic Durable Object', async () => {
   const calls = [];
   const env = {
-    PROBE_TOKEN: 'test-probe-token',
+    PROBE_TOKEN,
+    PROBE_LIMIT: { limit: async () => ({ success: true }) },
     RELAY_PROBE: {
       getByName(name) {
         assert.equal(name, 'personal-telegram-relay-validation-v1');
@@ -43,7 +47,7 @@ test('worker forwards internal probe routes to one deterministic Durable Object'
 
   const response = await handleRequest(
     new Request('https://probe.example/probe/sqlite', {
-      headers: { Authorization: 'Bearer test-probe-token' },
+      headers: { Authorization: `Bearer ${PROBE_TOKEN}` },
     }),
     env,
   );
@@ -54,7 +58,7 @@ test('worker forwards internal probe routes to one deterministic Durable Object'
 test('worker rejects unauthenticated probe requests before touching the Durable Object', async () => {
   let touched = false;
   const env = {
-    PROBE_TOKEN: 'test-probe-token',
+    PROBE_TOKEN,
     RELAY_PROBE: {
       idFromName() {
         touched = true;
@@ -141,6 +145,7 @@ test('Cloudflare probe lets the runtime generate WebSocket handshake headers', a
   try {
     globalThis.fetch = async (url, options) => {
       assert.equal(url, 'https://pluto.web.telegram.org/apiws');
+      assert.equal(options.redirect, 'manual');
       assert.deepEqual(options.headers, {
         Upgrade: 'websocket',
         'Sec-WebSocket-Protocol': 'binary',
@@ -166,6 +171,28 @@ test('Cloudflare probe lets the runtime generate WebSocket handshake headers', a
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('validation probe rejects uncovered redirects and does not dial a second host', async (t) => {
+  const fetch = t.mock.method(globalThis, 'fetch', async () => Response.redirect('https://example.com'));
+  const response = await new RelayProbe({}, {}).fetch(new Request('https://do/probe/outbound-wss'));
+  assert.equal(response.status, 502);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.equal(fetch.mock.calls[0].arguments[1].redirect, 'manual');
+});
+
+test('validation probe denies weak credentials and exhausted limits before the DO', async () => {
+  const request = token => new Request('https://probe.example/probe/sqlite', {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const env = { get RELAY_PROBE() { assert.fail('must not reach the DO'); } };
+  assert.equal((await handleRequest(request('weak'), { PROBE_TOKEN: 'weak' })).status, 404);
+  const blocked = Object.create(env);
+  blocked.PROBE_TOKEN = PROBE_TOKEN;
+  blocked.PROBE_LIMIT = { limit: async () => ({ success: false }) };
+  assert.equal((await handleRequest(request(PROBE_TOKEN), blocked)).status, 429);
+  delete blocked.PROBE_LIMIT;
+  assert.equal((await handleRequest(request(PROBE_TOKEN), blocked)).status, 503);
 });
 
 test('Durable Object dial probe starts up to eight handshakes together and cycles DC hosts', async () => {

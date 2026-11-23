@@ -29,6 +29,38 @@ const DEFAULT_MAX_PENDING_ITEMS = 32 * 1024;
 const DEFAULT_MAX_STREAM_PENDING_ITEMS = 4 * 1024;
 const DEFAULT_MAX_TOMBSTONES = 4096;
 const DEFAULT_MAX_CONCURRENT_DIALS = 4;
+const SESSION_BYTES_PER_SECOND = 8 * 1024 * 1024;
+const SESSION_FRAMES_PER_SECOND = 8192;
+const MAX_SOCKET_BUFFER = 4 * 1024 * 1024;
+const MAX_FAILED_INITS = 4;
+
+class BurstBudget {
+  constructor(rate, now) {
+    this.rate = rate;
+    this.remaining = rate;
+    this.updatedAt = now;
+  }
+
+  take(amount, now) {
+    if (now > this.updatedAt) {
+      this.remaining = Math.min(this.rate, this.remaining + (now - this.updatedAt) * this.rate / 1000);
+      this.updatedAt = now;
+    }
+    if (amount > this.remaining) return false;
+    this.remaining -= amount;
+    return true;
+  }
+}
+
+export function sendBounded(socket, bytes) {
+  // Some Workers WebSockets do not expose a buffer size or drain signal.
+  // The independent byte/frame rate budgets also apply on those runtimes.
+  const buffered = socket.bufferedAmount;
+  if (typeof buffered === 'number' && buffered + bytes.byteLength > MAX_SOCKET_BUFFER) {
+    throw new Error('WebSocket send buffer limit');
+  }
+  socket.send(bytes);
+}
 
 export class DialLimiter {
   constructor(maxConcurrent = DEFAULT_MAX_CONCURRENT_DIALS, maxQueued = 256) {
@@ -139,6 +171,7 @@ export async function openTelegramWss(target, options = {}) {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(`https://${target.host}/apiws`, {
+      redirect: 'manual',
       headers: {
         Upgrade: 'websocket',
         'Sec-WebSocket-Protocol': 'binary',
@@ -190,6 +223,19 @@ export class RelayEngine {
     this.dialTelegram = options.dialTelegram;
     this.writeCarrier = options.sendCarrier;
     this.closeCarrier = options.closeCarrier;
+    this.onAuthenticated = options.onAuthenticated;
+    this.onTraffic = options.onTraffic;
+    this.now = options.now ?? Date.now;
+    const started = this.now();
+    const byteRate = options.bytesPerSecond ?? SESSION_BYTES_PER_SECOND;
+    const frameRate = options.framesPerSecond ?? SESSION_FRAMES_PER_SECOND;
+    this.carrierBytes = new BurstBudget(byteRate, started);
+    this.carrierFrames = new BurstBudget(frameRate, started);
+    this.upstreamBytes = new BurstBudget(byteRate, started);
+    this.downstreamBytes = new BurstBudget(byteRate, started);
+    this.downstreamMessages = new BurstBudget(frameRate, started);
+    this.carrierWrites = new BurstBudget(frameRate, started);
+    this.failedInits = 0;
     this.dialLimiter = options.dialLimiter ?? new DialLimiter();
     this.initialWindow = options.initialWindow ?? INITIAL_STREAM_WINDOW;
     this.maxDataChunk = options.maxDataChunk ?? MAX_DATA_CHUNK;
@@ -228,6 +274,7 @@ export class RelayEngine {
 
   sendCarrier(frame) {
     if (this.carrierClosed) return false;
+    if (!this.carrierWrites.take(1, this.now())) return this.rateExceeded();
     try {
       this.writeCarrier(frame);
       return true;
@@ -235,6 +282,16 @@ export class RelayEngine {
       this.terminateCarrier(1011, 'carrier write failed');
       return false;
     }
+  }
+
+  rateExceeded() {
+    this.terminateCarrier(1008, 'carrier rate limit');
+    return false;
+  }
+
+  acceptCarrierBatch(bytes, frames) {
+    const now = this.now();
+    return (this.carrierBytes.take(bytes, now) && this.carrierFrames.take(frames, now)) || this.rateExceeded();
   }
 
   handleFrame(frame) {
@@ -331,7 +388,8 @@ export class RelayEngine {
       try {
         result = stream.accumulator.push(payload);
       } catch {
-        this.failStream(stream, 'invalid MTProxy init');
+        if (++this.failedInits >= MAX_FAILED_INITS) this.terminateCarrier(1008, 'MTProxy initialization limit');
+        else this.failStream(stream, 'invalid MTProxy init');
         return;
       }
       if (!result.ready) return;
@@ -351,6 +409,7 @@ export class RelayEngine {
       }
       if (!this.queueUp(stream, data, stream.preinitCredit)) return;
       stream.preinitCredit = 0;
+      this.onAuthenticated?.();
       return this.startDial(stream);
     }
     const plain = stream.parsed.clientRx.update(payload);
@@ -413,6 +472,10 @@ export class RelayEngine {
   flushUp(stream) {
     if (!stream.socket || stream.closed) return;
     while (!stream.closed && stream.pendingUp.length) {
+      if (!this.upstreamBytes.take(stream.pendingUp[0].data.length, this.now())) {
+        this.rateExceeded();
+        return;
+      }
       const item = stream.pendingUp.shift();
       stream.pendingUpBytes -= item.data.length;
       stream.pendingUpItems -= 1;
@@ -420,11 +483,12 @@ export class RelayEngine {
       this.pendingItems -= 1;
       this.budget.release(item.data.length);
       try {
-        stream.socket.send(item.data);
+        sendBounded(stream.socket, item.data);
       } catch {
         this.failStream(stream, 'Telegram WSS write failed');
         return;
       }
+      this.onTraffic?.();
       stream.clientCredit += item.credit;
       if (!this.sendCarrier(encodeFrame(
         FRAME_TYPES.WINDOW,
@@ -438,6 +502,11 @@ export class RelayEngine {
     if (stream.closed) return;
     if (!(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) {
       this.failStream(stream, 'non-binary Telegram WSS message');
+      return;
+    }
+    const now = this.now();
+    if (!this.downstreamMessages.take(1, now) || !this.downstreamBytes.take(value.byteLength, now)) {
+      this.rateExceeded();
       return;
     }
     // View the incoming buffer, then transform bounded slices instead of making
@@ -493,7 +562,9 @@ export class RelayEngine {
     stream.downOutstanding += chunk.length;
     stream.sentDown.push(chunk.length);
     this.downOutstanding += chunk.length;
-    return this.sendCarrier(encodeFrame(FRAME_TYPES.DATA, stream.id, chunk));
+    if (!this.sendCarrier(encodeFrame(FRAME_TYPES.DATA, stream.id, chunk))) return false;
+    this.onTraffic?.();
+    return true;
   }
 
   releaseDownOutstanding(stream, amount) {

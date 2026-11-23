@@ -11,13 +11,13 @@ import { recordElapsed, timeOperation } from './probe-timing.mjs';
 export async function runPublicRelayProbe({
   config = resolveProbeConfig(), fetchImpl = fetch, WebSocketImpl = WebSocket, timeoutMs = 20000,
 } = {}) {
-  const { secretHex, host, base, transportTag } = config;
+  const { secretHex, host, base, basePath, transportTag } = config;
   const transport = transportTag === 0xdddddddd ? 'padded-intermediate' : 'abridged';
   const report = { host, transport, dcId: -2 };
   report.timings = {};
   const probeStarted = performance.now();
   let sessionToken = '', socket = null;
-  const http = (path, options = {}) => fetchImpl(`${base}${path}`, {
+  const http = (url, options = {}) => fetchImpl(url, {
     ...options, redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
   });
   async function boundedBody(response, maxBytes) {
@@ -39,12 +39,12 @@ export async function runPublicRelayProbe({
     } finally { reader.releaseLock(); }
   }
   try {
-    const health = await timeOperation(report.timings, 'healthMs', () => http('/healthz'));
+    const health = await timeOperation(report.timings, 'healthMs', () => http(`https://${host}/healthz`));
     report.healthStatus = health.status;
     void health.body?.cancel().catch(() => {});
-    const capability = computeCapability(host, secretHex);
+    const capability = computeCapability(host, secretHex, basePath);
     const { bridge, body } = await timeOperation(report.timings, 'bridgeMs', async () => {
-      const bridge = await http(`/?bridge=${capability}`);
+      const bridge = await http(`${base}/?bridge=${capability}`);
       return { bridge, body: await boundedBody(bridge, 65536) };
     });
     report.bridgeStatus = bridge.status;
@@ -52,7 +52,7 @@ export async function runPublicRelayProbe({
     report.bootstrapPresent = Boolean(bootstrap);
     if (bridge.status !== 200 || !bootstrap) { report.result = 'bridge-failed'; return report; }
     const { session, welcome } = await timeOperation(report.timings, 'sessionMs', async () => {
-      const session = await http('/api/v1/session', {
+      const session = await http(`${base}/api/v1/session`, {
         method: 'POST', headers: { Authorization: `Bearer ${bootstrap}`, 'Content-Type': 'application/octet-stream' },
         body: encodeFrame(FRAME_TYPES.HELLO, 0, Buffer.of(1)),
       });
@@ -143,7 +143,7 @@ export async function runPublicRelayProbe({
     }
     if (/^[A-Za-z0-9_-]{43}$/.test(sessionToken)) {
       try {
-        const response = await http('/api/v1/session', { method: 'DELETE', headers: { Authorization: `Bearer ${sessionToken}` } });
+        const response = await http(`${base}/api/v1/session`, { method: 'DELETE', headers: { Authorization: `Bearer ${sessionToken}` } });
         void response.body?.cancel().catch(() => {});
       } catch {}
     }

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { createCipheriv } from 'node:crypto';
+import { createCipheriv, randomBytes } from 'node:crypto';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 
 import {
   RelayDO,
+  computeCapability,
   FRAME_TYPES,
   encodeFrame,
   handleRequest,
@@ -13,7 +14,7 @@ import {
 import { deriveProxyKeyMaterial, TRANSPORT_TAGS } from '../src/mtproxy.js';
 import { decodeFrames } from '../src/protocol.js';
 
-const SECRET_HEX = '000102030405060708090a0b0c0d0e0f';
+const SECRET_HEX = randomBytes(16).toString('hex');
 const HOST = 'relay.example.com';
 
 function makeStorage() {
@@ -25,6 +26,7 @@ function makeStorage() {
 function makeRuntime(doEnv = {}) {
   const relay = new RelayDO({ storage: makeStorage() }, {
     PROXY_SECRET: SECRET_HEX,
+    PROXY_ALLOW_ROOT_V1: true,
     RELAY_DEBUG: '0',
     USE_HIBERNATION: '1',
     ...doEnv,
@@ -34,6 +36,9 @@ function makeRuntime(doEnv = {}) {
   };
   const env = {
     PROXY_SECRET: SECRET_HEX,
+    PROXY_ALLOW_ROOT_V1: true,
+    RELAY_CLIENT_LIMIT: { limit: async () => ({ success: true }) },
+    RELAY_EDGE_LIMIT: { limit: async () => ({ success: true }) },
     RELAY: {
       getByName(name) {
         assert.equal(name, 'personal-telegram-relay-v1');
@@ -151,6 +156,62 @@ test('invalid bridge query stays on the ordinary public response', async () => {
   );
   assert.equal(response.status, 200);
   assert.match(await response.text(), /Telegram WEB Proxy/);
+});
+
+test('bridge configuration fails closed by default and accepts only explicit true for root v1', async () => {
+  const path = 'Relay/v2';
+  const root = `/?bridge=${computeCapability(HOST, SECRET_HEX)}`;
+  const prefixed = `/${path}/?bridge=${computeCapability(HOST, SECRET_HEX, path)}`;
+  const call = (url, env) => handleRequest(new Request(`https://${HOST}${url}`), env);
+  for (const config of [{}, { PROXY_ALLOW_ROOT_V1: false }, { PROXY_ALLOW_ROOT_V1: 'false' },
+    { PROXY_ALLOW_ROOT_V1: 'True', PROXY_BASE_PATH: path },
+    { PROXY_ALLOW_ROOT_V1: true, PROXY_BASE_PATH: `/${path}` }]) {
+    const env = { ...config, PROXY_SECRET: SECRET_HEX,
+      get RELAY() { assert.fail('must not visit the Durable Object'); } };
+    assert.equal((await call('/healthz', config)).status, 200);
+    for (const url of [root, prefixed, '/api/v1/session', '/api/v1/ws']) {
+      assert.equal((await call(url, env)).status, 404);
+    }
+  }
+  const { env } = makeRuntime();
+  for (const flag of [true, 'true']) {
+    const response = await call(root, { ...env, PROXY_ALLOW_ROOT_V1: flag });
+    assert.match(await response.text(), /bootstrap=/);
+  }
+});
+
+test('enabled bridge scopes do not share bootstrap or session tokens', async () => {
+  const basePath = 'Relay/v2';
+  const { env } = makeRuntime({ PROXY_BASE_PATH: basePath });
+  env.PROXY_BASE_PATH = basePath;
+  const get = (path, init) => handleRequest(new Request(`https://${HOST}${path}`, init), env);
+  const rootCap = computeCapability(HOST, SECRET_HEX);
+  const prefixedCap = computeCapability(HOST, SECRET_HEX, basePath);
+  assert.doesNotMatch(await (await get(`/?bridge=${prefixedCap}`)).text(), /bootstrap=/);
+  for (const path of [`/${basePath}/?bridge=${rootCap}`, `/relay/v2/?bridge=${prefixedCap}`,
+    `/${basePath}?bridge=${prefixedCap}`, `/${basePath}/?bridge=${prefixedCap}&extra=1`]) {
+    assert.equal((await get(path)).status, 404);
+  }
+  const bridge = await get(`/${basePath}/?bridge=${prefixedCap}`);
+  const html = await bridge.text();
+  const bootstrap = /bootstrap="([A-Za-z0-9_-]{43})"/.exec(html)[1];
+  const sessionPath = '/api/v1/session';
+  const api = `/${basePath}${sessionPath}`;
+  const trace = [];
+  const result = await runBridgeSessionScript(html, async (url, init) => {
+    trace.push([url, init.method]);
+    return get(new URL(url).pathname, init);
+  }, Uint8Array.from(hello()).buffer);
+  assert.deepEqual(trace, [[`https://${HOST}${api}`, 'POST']]);
+  assert.equal(result.sockets[0].url, `wss://${HOST}/${basePath}/api/v1/ws`);
+  const protocol = result.sockets[0].protocol;
+  assert.equal((await get(sessionPath, { method: 'POST', body: hello(), headers: {
+    Authorization: `Bearer ${bootstrap}`, 'Content-Type': 'application/octet-stream',
+  } })).status, 404);
+  assert.equal((await get('/api/v1/ws', { headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': protocol } })).status, 404);
+  result.port.onmessage({ data: { t: 'close' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(trace.at(-1), [`https://${HOST}${api}`, 'DELETE']);
 });
 
 test('worker routes the personal relay through DurableObjectNamespace.getByName', async () => {
@@ -286,6 +347,22 @@ test('bridge applies exponential backoff when a 503 omits Retry-After', async ()
   assert.deepEqual(result.delays, [250]);
 });
 
+test('bridge does not retry a rate limit before Retry-After', async () => {
+  const { env } = makeRuntime();
+  const page = await handleRequest(new Request(`https://${HOST}/?bridge=${await capabilityFor()}`), env);
+  let calls = 0;
+  const result = await runBridgeSessionScript(await page.text(), async () => {
+    calls += 1;
+    return new Response(null, { status: 429, headers: { 'Retry-After': '60' } });
+  }, Uint8Array.from(hello()).buffer);
+  assert.equal(calls, 1);
+  assert.deepEqual(result.delays, []);
+  assert.ok([...result.deadlines.values()].length >= 2, 'schedules a wait in addition to the total deadline');
+  result.port.onmessage({ data: { t: 'close' } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(result.deadlines.size, 0);
+});
+
 test('bridge delivers WELCOME before it creates the carrier WebSocket', async () => {
   const { env } = makeRuntime();
   const capability = await capabilityFor();
@@ -311,7 +388,7 @@ test('HELLO creates an idempotent WELCOME session and rejects a different body',
   assert.ok(match);
   const bootstrap = match[1];
 
-  const create = () => handleRequest(new Request('https://relay/api/v1/session', {
+  const create = () => handleRequest(new Request(`https://${HOST}/api/v1/session`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${bootstrap}`,
@@ -336,7 +413,7 @@ test('HELLO creates an idempotent WELCOME session and rejects a different body',
     '1100000000000000',
   );
 
-  const wrong = await handleRequest(new Request('https://relay/api/v1/session', {
+  const wrong = await handleRequest(new Request(`https://${HOST}/api/v1/session`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${bootstrap}`,
@@ -546,12 +623,12 @@ test('carrier protocol parsing accepts only the exact websocket v1 bearer', () =
   }
 });
 
-test('carrier attach emits no application frame or heartbeat timer', async () => {
+test('carrier attach emits no application frame and reclaims unauthenticated sessions on deadline', async () => {
   const sent = [];
   const timers = [];
   const server = {
     send(value) { sent.push(value); },
-    close() {},
+    close(code) { this.code = code; },
     accept() {},
     addEventListener() {},
   };
@@ -592,7 +669,15 @@ test('carrier attach emits no application frame or heartbeat timer', async () =>
     }));
 
     assert.equal(sent.length, 0);
-    assert.equal(timers.length, 0);
+    assert.deepEqual(timers.map(({ delay }) => delay), [20_000]);
+    assert.equal(relay.bootstraps.size, 0);
+    relay.webSocketMessage(server, encodeFrame(FRAME_TYPES.OPEN, 1));
+    assert.equal(timers.length, 1, 'OPEN does not reset the authentication deadline');
+    timers[0].handler();
+    assert.equal(server.code, 1008);
+    assert.equal(relay.sessionSet.size, 0);
+    assert.equal(relay.sessions.size, 0);
+    assert.equal(relay.sockets.size, 0);
   } finally {
     globalThis.WebSocketPair = previous;
   }
@@ -686,7 +771,7 @@ test('carrier loss destroys the session token and all registry entries', async (
         'Sec-WebSocket-Protocol': `tproxy-v1.${token}`,
       },
     }));
-    assert.equal(relay.sessions.size, 2);
+    assert.equal(relay.sessions.size, 1);
 
     relay.webSocketClose(server);
 
@@ -825,7 +910,10 @@ test('standard WebSocket message events register outbound dial work with waitUnt
   }
 });
 
-test('carrier forwards OPEN and MTProxy DATA into an injected Telegram WSS dialer', async () => {
+test('carrier forwards MTProxy data and reclaims an authenticated session only after traffic goes idle', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000 });
+  const timers = new Map();
+  let nextTimer = 0;
   const upstream = {
     sent: [],
     listeners: new Map(),
@@ -850,6 +938,12 @@ test('carrier forwards OPEN and MTProxy DATA into an injected Telegram WSS diale
   try {
     const { relay, env } = makeRuntime({
       __randomBytes: (size) => Buffer.from(Array.from({ length: size }, (_, index) => 0x60 + index)),
+      __setTimeout(handler, delay) {
+        timers.set(++nextTimer, { handler, delay });
+        return nextTimer;
+      },
+      __clearTimeout(id) { timers.delete(id); },
+      __carrierTimeouts: { initMs: 20_000, idleMs: 100_000 },
       __dialTelegram: async (target) => {
         dials.push(target);
         return upstream;
@@ -873,6 +967,7 @@ test('carrier forwards OPEN and MTProxy DATA into an injected Telegram WSS diale
         'Sec-WebSocket-Protocol': `tproxy-v1.${token}`,
       },
     }));
+    assert.equal(timers.get(1).delay, 20_000);
     relay.webSocketMessage(server, encodeFrame(FRAME_TYPES.OPEN, 3));
     relay.webSocketMessage(server, encodeFrame(FRAME_TYPES.DATA, 3, clientInit(-2)));
     await relay.sockets.get(server).engine.whenIdle();
@@ -886,6 +981,25 @@ test('carrier forwards OPEN and MTProxy DATA into an injected Telegram WSS diale
     assert.equal(upstream.sent.reduce((sum, value) => sum + value.length, 0), 64);
     assert.equal(server.closed, undefined);
     assert.ok(sent.some((batch) => batch[0] === FRAME_TYPES.WINDOW));
+    assert.equal(timers.has(1), false, 'valid initialization cancels the initial deadline');
+    assert.equal(timers.get(2).delay, 100_000);
+
+    t.mock.timers.tick(80_000);
+    upstream.listeners.get('message')({ data: Buffer.of(1) });
+    t.mock.timers.tick(20_000);
+    timers.get(2).handler();
+    assert.equal(timers.get(3).delay, 80_000);
+    assert.equal(server.closed, undefined);
+
+    t.mock.timers.tick(80_000);
+    timers.get(3).handler();
+    assert.deepEqual(server.closed, { code: 1008, reason: 'carrier idle' });
+    assert.equal(upstream.closed.code, 1000);
+    assert.equal(timers.size, 0);
+    assert.equal(relay.sessionSet.size, 0);
+    assert.equal(relay.sessions.size, 0);
+    assert.equal(relay.relayBudget.pendingBytes, 0);
+    assert.equal(relay.relayBudget.outstandingBytes, 0);
   } finally {
     globalThis.WebSocketPair = previous;
   }

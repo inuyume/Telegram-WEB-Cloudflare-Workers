@@ -1,5 +1,6 @@
-export function bridgePage(host, bootstrap, nonce) {
+export function bridgePage(host, bootstrap, nonce, basePath = '') {
   const origin = `https://${host}`;
+  const base = basePath ? `${origin}/${basePath}` : origin;
   const csp = [
     "default-src 'none'",
     'base-uri \'none\'',
@@ -18,7 +19,7 @@ export function bridgePage(host, bootstrap, nonce) {
 <script nonce="${nonce}">
 (()=>{
 'use strict';
-const relayOrigin=${JSON.stringify(origin)},bootstrap=${JSON.stringify(bootstrap)};
+const relayBase=${JSON.stringify(base)},bootstrap=${JSON.stringify(bootstrap)};
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',socket=null,creating=false;
@@ -41,7 +42,7 @@ const sleep=ms=>new Promise((resolve,reject)=>{
 function sessionRetryDelay(response,attempt){
  const header=response?.headers.get('Retry-After');
  const seconds=header===null||header===undefined||header===''?NaN:Number(header);
- if(Number.isFinite(seconds)&&seconds>=0)return Math.min(SESSION_RETRY_MAX_MS,seconds*1000);
+  if(Number.isFinite(seconds)&&seconds>=0)return response.status===429?seconds*1000:Math.min(SESSION_RETRY_MAX_MS,seconds*1000);
  return Math.min(SESSION_RETRY_MAX_MS,250*(2**attempt));
 }
 async function requestSession(first){
@@ -49,14 +50,14 @@ async function requestSession(first){
  for(;;){
   if(closed||sessionAbort.signal.aborted)throw new Error('session cancelled');
   let response;
-  try{response=await fetch(relayOrigin+'/api/v1/session',Object.assign(requestOptions('POST',bootstrap,first),{signal:sessionAbort.signal}))}
+  try{response=await fetch(relayBase+'/api/v1/session',Object.assign(requestOptions('POST',bootstrap,first),{signal:sessionAbort.signal}))}
   catch(error){
    if(closed||sessionAbort.signal.aborted)throw error;
    const delay=sessionRetryDelay(null,attempt++);
    if(Date.now()-started+delay>SESSION_CREATE_BUDGET_MS)throw error;
    await sleep(delay);continue
   }
-  if(response.status!==503)return response;
+   if(response.status!==503&&response.status!==429)return response;
   const delay=sessionRetryDelay(response,attempt++);
   try{await response.body?.cancel()}catch(error){}
   if(Date.now()-started+delay>SESSION_CREATE_BUDGET_MS)return response;
@@ -74,7 +75,7 @@ function close(notifyServer){
  closed=true;
  sessionAbort?.abort();
  if(socket)try{socket.close()}catch(error){}
- if(notifyServer&&sessionToken)fetch(relayOrigin+'/api/v1/session',requestOptions('DELETE',sessionToken,null,true)).catch(()=>{});
+ if(notifyServer&&sessionToken)fetch(relayBase+'/api/v1/session',requestOptions('DELETE',sessionToken,null,true)).catch(()=>{});
  pending.length=0;pendingBytes=0;
  if(port)port.close();
 }
@@ -89,7 +90,7 @@ function queueCarrier(data){
 }
 function openWebSocket(){
  return new Promise((resolve,reject)=>{
-  const target=relayOrigin.replace(/^https:/,'wss:')+'/api/v1/ws';
+   const target=relayBase.replace(/^https:/,'wss:')+'/api/v1/ws';
   socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
   socket.binaryType='arraybuffer';
   socket.onopen=()=>resolve();

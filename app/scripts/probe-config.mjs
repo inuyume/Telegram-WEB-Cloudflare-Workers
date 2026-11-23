@@ -1,4 +1,4 @@
-import { domainToASCII } from 'node:url';
+import { isProxyBasePath, normalizeWebProxyHost } from '../src/capability.js';
 
 export function resolveProbeConfig({
   argv = process.argv.slice(2),
@@ -11,23 +11,19 @@ export function resolveProbeConfig({
 
   const input = String(argv[0] ?? env.TASK_PROXY_HOST ?? '').trim();
   if (!input) throw new Error('TASK_PROXY_HOST or a CLI host argument is required');
-  let url;
-  try {
-    url = new URL(input.includes('://') ? input : `https://${input}`);
-  } catch {
-    throw new Error('TASK_PROXY_HOST is invalid');
-  }
-  const host = domainToASCII(url.hostname).toLowerCase();
-  if (url.protocol !== 'https:' || url.username || url.password || url.port
-    || (url.pathname !== '/' && url.pathname !== '') || url.search || url.hash
-    || !host || !host.includes('.')) {
-    throw new Error('TASK_PROXY_HOST must be a public HTTPS hostname');
+  // Check the raw path before URL parsing can normalize dot segments or escapes.
+  const match = /^(?:https:\/\/)?([^/\\:@?#%\s]+)(?:\/(.*))?$/i.exec(input);
+  const host = match ? normalizeWebProxyHost(match[1]) : '';
+  const basePath = match?.[2]?.replace(/\/$/, '') ?? '';
+  if (!host || (match[2] && !isProxyBasePath(basePath))) {
+    throw new Error('TASK_PROXY_HOST must be a public HTTPS hostname with an optional valid base path');
   }
 
   return {
     secretHex,
     host,
-    base: `https://${host}`,
+    basePath,
+    base: `https://${host}${basePath ? `/${basePath}` : ''}`,
     transportTag: secretHex.length === 34 ? 0xdddddddd : 0xefefefef,
   };
 }

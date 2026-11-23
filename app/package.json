@@ -15,7 +15,7 @@
     "websocket"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "test": "node --import ./test-support/register-cloudflare-hooks.mjs --test",
@@ -29,15 +29,12 @@
     "lint": "node scripts/check-syntax.mjs"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.1.1",
-    "vitest": "4.1.11",
-    "wrangler": "4.127.0"
+    "@cloudflare/vitest-plugin": "1.9.0",
+    "vitest": "4.1.12",
+    "wrangler": "4.166.0"
   },
   "repository": {
     "type": "git",
     "url": ""
-  },
-  "overrides": {
-    "sharp": "0.35.4"
   }
 }

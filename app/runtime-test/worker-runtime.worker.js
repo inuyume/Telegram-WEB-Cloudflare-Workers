@@ -6,6 +6,7 @@ import { decodeFrames, encodeFrame, FRAME_TYPES } from '../src/protocol.js';
 
 const HOST = 'relay.example.com';
 const request = (path, init) => exports.default.fetch(new Request(`https://${HOST}${path}`, init));
+const proxy = (path, init) => request(`/${env.PROXY_BASE_PATH}${path}`, init);
 function nextEvent(socket, type) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { socket.removeEventListener(type, done); reject(new Error(`${type} deadline exceeded`)); }, 1000);
@@ -14,12 +15,12 @@ function nextEvent(socket, type) {
   });
 }
 async function connect() {
-  const capability = computeCapability(HOST, env.PROXY_SECRET);
-  const bridge = await request(`/?bridge=${capability}`);
+  const capability = computeCapability(HOST, env.PROXY_SECRET, env.PROXY_BASE_PATH);
+  const bridge = await proxy(`/?bridge=${capability}`);
   expect(bridge.status).toBe(200);
   const bootstrap = /bootstrap="([A-Za-z0-9_-]{43})"/.exec(await bridge.text())?.[1];
   expect(bootstrap).toMatch(/^[A-Za-z0-9_-]{43}$/);
-  const create = () => request('/api/v1/session', {
+  const create = () => proxy('/api/v1/session', {
     method: 'POST', headers: { Authorization: `Bearer ${bootstrap}`, 'Content-Type': 'application/octet-stream' },
     body: encodeFrame(FRAME_TYPES.HELLO, 0, Uint8Array.of(1)),
   });
@@ -30,7 +31,7 @@ async function connect() {
   const retry = await create();
   expect(retry.headers.get('x-session-token')).toBe(token);
   await retry.arrayBuffer();
-  const upgrade = await request('/api/v1/ws', { headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `tproxy-v1.${token}` } });
+  const upgrade = await proxy('/api/v1/ws', { headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `tproxy-v1.${token}` } });
   expect(upgrade.status).toBe(101);
   const socket = upgrade.webSocket;
   socket.binaryType = 'arraybuffer';
@@ -38,9 +39,9 @@ async function connect() {
   return { socket, token, bootstrap };
 }
 async function expectRevoked(token, bootstrap) {
-  const attach = await request('/api/v1/ws', { headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `tproxy-v1.${token}` } });
+  const attach = await proxy('/api/v1/ws', { headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `tproxy-v1.${token}` } });
   expect(attach.status).toBe(404);
-  const replay = await request('/api/v1/session', {
+  const replay = await proxy('/api/v1/session', {
     method: 'POST', headers: { Authorization: `Bearer ${bootstrap}`, 'Content-Type': 'application/octet-stream' },
     body: encodeFrame(FRAME_TYPES.HELLO, 0, Uint8Array.of(1)),
   });
@@ -48,9 +49,19 @@ async function expectRevoked(token, bootstrap) {
 }
 
 describe('Workers runtime carrier', () => {
-  it('uses the Cloudflare DurableObject base class and checks readiness', async () => {
+  it('uses the Cloudflare DurableObject base class without public readiness access', async () => {
     expect(RelayDO.prototype instanceof DurableObject).toBe(true);
-    expect((await request('/readyz')).status).toBe(200);
+    expect((await request('/healthz')).status).toBe(200);
+    expect((await request('/readyz')).status).toBe(404);
+    const rootCapability = computeCapability(HOST, env.PROXY_SECRET);
+    expect((await request(`/?bridge=${rootCapability}`)).status).toBe(404);
+  });
+  it('closes an unauthenticated socket at its deadline and revokes its tokens', async () => {
+    const { socket, token, bootstrap } = await connect();
+    const closed = nextEvent(socket, 'close');
+    socket.send(encodeFrame(FRAME_TYPES.OPEN, 1));
+    expect((await closed).code).toBe(1008);
+    await expectRevoked(token, bootstrap);
   });
   it('completes the peer Close handshake and revokes its session and bootstrap', async () => {
     const { socket, token, bootstrap } = await connect();

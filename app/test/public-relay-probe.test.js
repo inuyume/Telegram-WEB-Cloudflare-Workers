@@ -2,15 +2,23 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runPublicRelayProbe } from '../scripts/public-relay-probe.mjs';
 import { resolveProbeConfig } from '../scripts/probe-config.mjs';
+import { computeCapability } from '../src/capability.js';
 import { parseMtproxyClientInit } from '../src/mtproxy.js';
 import { decodeFrames, encodeFrame, FRAME_TYPES } from '../src/protocol.js';
 
 for (const padded of [false, true]) {
   test(`public probe sends a valid ${padded ? 'dd' : 'plain'} packet and verifies the reply`, async () => {
     const secret = `${padded ? 'dd' : ''}000102030405060708090a0b0c0d0e0f`;
+    const basePath = padded ? 'Relay/v2' : '';
+    const prefix = basePath ? `/${basePath}` : '';
     let deleted = false, packetChecked = false;
     class Peer extends EventTarget {
-      constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
+      constructor(url, protocol) {
+        super();
+        assert.equal(url, `wss://relay.example.com${prefix}/api/v1/ws`);
+        assert.equal(protocol, `tproxy-v1.${'B'.repeat(43)}`);
+        queueMicrotask(() => this.dispatchEvent(new Event('open')));
+      }
       close() {}
       send(batch) {
         const [frame] = decodeFrames(batch);
@@ -47,11 +55,16 @@ for (const padded of [false, true]) {
       }
     }
     const report = await runPublicRelayProbe({
-      config: resolveProbeConfig({ argv: ['relay.example.com'], env: { TASK_PROXY_SECRET: secret } }),
+      config: resolveProbeConfig({ argv: [`relay.example.com${prefix}`], env: { TASK_PROXY_SECRET: secret } }),
       WebSocketImpl: Peer,
       fetchImpl: async (url, options) => {
-        if (new URL(url).pathname === '/healthz') return Response.json({ ok: true });
-        if (new URL(url).pathname === '/') return new Response(`bootstrap="${'A'.repeat(43)}"`);
+        const target = new URL(url);
+        if (target.pathname === '/healthz') return Response.json({ ok: true });
+        if (target.pathname === `${prefix}/`) {
+          assert.equal(target.searchParams.get('bridge'), computeCapability(target.hostname, secret, basePath));
+          return new Response(`bootstrap="${'A'.repeat(43)}"`);
+        }
+        assert.equal(target.pathname, `${prefix}/api/v1/session`);
         if (options.method === 'DELETE') { deleted = true; return new Response(null, { status: 204 }); }
         return new Response(encodeFrame(FRAME_TYPES.WELCOME, 0), { headers: {
           'x-session-token': 'B'.repeat(43), 'x-carrier-mode': 'websocket',

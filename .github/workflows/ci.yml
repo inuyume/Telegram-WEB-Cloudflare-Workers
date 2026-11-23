@@ -18,6 +18,9 @@ jobs:
       - name: Install app
         working-directory: app
         run: npm ci --no-audit --no-fund
+      - name: Audit locked app dependencies
+        working-directory: app
+        run: npm audit --package-lock-only --audit-level=high
       - name: Unit tests — app
         working-directory: app
         run: npm test

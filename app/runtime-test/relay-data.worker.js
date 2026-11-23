@@ -93,3 +93,36 @@ for (const padded of [false, true]) {
     expect(engine.budget.outstandingBytes).toBe(0);
   });
 }
+
+it('releases queued writes when a delayed upstream exceeds the session send budget', async () => {
+  const [upstream, peer] = Object.values(new WebSocketPair());
+  const [client, carrier] = Object.values(new WebSocketPair());
+  for (const ws of [upstream, peer, client, carrier]) ws.accept();
+  const closed = new Promise(resolve => client.addEventListener('close', resolve, { once: true }));
+  // First payload fits, but draining the delayed queue must not push both into a
+  // WebSocket that may not report bufferedAmount.
+  const engine = new RelayEngine({
+    secret: '000102030405060708090a0b0c0d0e0f',
+    bytesPerSecond: 64,
+    now: () => 0,
+    sendCarrier: value => carrier.send(value),
+    closeCarrier: (code, reason) => carrier.close(code, reason),
+  });
+  try {
+    engine.handleFrame({ type: FRAME_TYPES.OPEN, streamId: 1, payload: Buffer.alloc(0) });
+    const stream = engine.streams.get(1);
+    for (let i = 0; i < 2; i++) expect(engine.queueUp(stream, Buffer.alloc(64), 64)).toBe(true);
+    expect(engine.budget.pendingBytes).toBe(128);
+
+    stream.socket = upstream;
+    engine.flushUp(stream);
+
+    expect((await closed).code).toBe(1008);
+    expect(engine.budget.pendingBytes).toBe(0);
+    expect(engine.budget.pendingItems).toBe(0);
+    expect(engine.streams.size).toBe(0);
+  } finally {
+    engine.shutdown();
+    for (const ws of [upstream, peer, client, carrier]) { try { ws.close(1000); } catch {} }
+  }
+});

@@ -4,15 +4,34 @@ name = "telegram-web-cloudflare-workers"
 main = "app/src/index.js"
 compatibility_date = "2026-08-25"
 compatibility_flags = ["nodejs_compat"]
+# Version Preview URLs are not needed for a private relay. workers.dev remains
+# available for free deployments; disable it when moving to a custom domain.
+preview_urls = false
 
 [vars]
+PROXY_ALLOW_ROOT_V1 = false
+# PROXY_BASE_PATH = "my-relay" # Set a path to enable bridge v2.
 # RELAY_DEBUG = "0"
+# RELAY_ALLOWED_IPS = "192.0.2.1,2001:db8::1" # Replace with your fixed public source addresses.
 
 [observability]
 enabled = true
 
 [observability.logs]
 invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[[ratelimits]]
+name = "RELAY_CLIENT_LIMIT"
+namespace_id = "92001"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "RELAY_EDGE_LIMIT"
+namespace_id = "92002"
+simple = { limit = 120, period = 60 }
 
 [[durable_objects.bindings]]
 name = "RELAY"
